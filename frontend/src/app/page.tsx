@@ -48,7 +48,7 @@ export default function Home() {
     setLoading(true);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/booking", {
+      const res = await fetch("https://cinemate-ai-backend.onrender.com/api/booking", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
