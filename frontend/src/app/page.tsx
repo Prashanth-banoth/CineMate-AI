@@ -66,7 +66,7 @@ type ConfirmedBooking = {
   simulation: boolean;
 };
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = "https://cinemate-ai-backend.onrender.com";
 
 export default function Home() {
   const [prompt, setPrompt] = useState("");
