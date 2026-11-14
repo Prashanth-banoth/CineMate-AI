@@ -3,4 +3,4 @@ fastapi
 uvicorn[standard]
 google-genai
 python-dotenv
-
+psycopg[binary]

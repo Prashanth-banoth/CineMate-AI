@@ -2,6 +2,12 @@
 import json
 import os
 import uuid
+import hashlib
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.errors import UniqueViolation
+
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -10,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # -------------------------------------------------------
@@ -20,16 +26,28 @@ from pydantic import BaseModel
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY is missing.")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is missing.")
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://",
+        "postgresql://",
+        1
+    )
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI(
     title="CineMate AI API",
-    description="AI-powered movie booking assistant",
-    version="1.0.0"
+    description="AI-powered movie discovery and booking assistant",
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -44,11 +62,44 @@ app.add_middleware(
 )
 
 
-# Temporary in-memory storage.
-# Data is cleared when the backend process restarts.
+# -------------------------------------------------------
+# STORAGE
+# -------------------------------------------------------
 
 booking_sessions = {}
-simulated_bookings = {}
+
+
+def get_db():
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=15
+    )
+
+
+def initialize_database():
+
+    with get_db() as connection:
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS booked_seats (
+                id BIGSERIAL PRIMARY KEY,
+                show_key TEXT NOT NULL,
+                seat_number TEXT NOT NULL,
+                booking_id TEXT NOT NULL,
+                UNIQUE(show_key, seat_number)
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS simulated_bookings (
+                booking_id TEXT PRIMARY KEY,
+                booking_data JSONB NOT NULL
+            )
+        """)
+
+
+initialize_database()
 
 
 # -------------------------------------------------------
@@ -63,52 +114,196 @@ class BookingRequest(BaseModel):
 class ConfirmBookingRequest(BaseModel):
     session_id: str
     seat_preference: str | None = None
+    selected_seats: list[str] | None = None
+
+
+class MovieRecommendationRequest(BaseModel):
+    mood: str = Field(min_length=1, max_length=50)
+    language: str = "Any"
+    genre: str = "Any"
 
 
 # -------------------------------------------------------
-# SIMULATED AGENT TOOLS
+# THEATRE CONFIGURATION
 # -------------------------------------------------------
 
-def search_showtimes(movie: str, theatre: str, date: str) -> dict:
-    """
-    Search simulated showtimes.
-    This demo currently supports AMB Cinemas only.
-    """
+DEMO_THEATRES = [
+    {
+        "name": "AMB Cinemas",
+        "available": True
+    }
+]
 
-    if theatre.strip().lower() not in ["amb cinemas", "amb"]:
+
+# -------------------------------------------------------
+# SEAT CONFIGURATION
+# -------------------------------------------------------
+
+SEATS_BY_PREFERENCE = {
+    "front": [f"F{i}" for i in range(1, 31)],
+    "middle": [f"M{i}" for i in range(1, 41)],
+    "back": [f"B{i}" for i in range(1, 31)]
+}
+
+
+# -------------------------------------------------------
+# TIME NORMALIZATION
+# -------------------------------------------------------
+
+def normalize_time(value: str) -> str:
+
+    return (
+        value.strip()
+        .upper()
+        .replace(" ", "")
+        .replace(":00", "")
+    )
+
+
+# -------------------------------------------------------
+# SHOW KEY GENERATION
+# -------------------------------------------------------
+
+def make_show_key(
+    movie: str,
+    theatre: str,
+    date: str,
+    time: str
+) -> str:
+
+    raw_value = "|".join([
+        movie.strip().lower(),
+        theatre.strip().lower(),
+        date.strip().lower(),
+        time.strip().lower()
+    ])
+
+    return hashlib.sha256(
+        raw_value.encode("utf-8")
+    ).hexdigest()
+
+
+# -------------------------------------------------------
+# GET BOOKED SEATS
+# -------------------------------------------------------
+
+def get_booked_seats(show_key: str) -> list[str]:
+
+    with get_db() as connection:
+
+        rows = connection.execute(
+            """
+            SELECT seat_number
+            FROM booked_seats
+            WHERE show_key = %s
+            """,
+            (show_key,)
+        ).fetchall()
+
+    return [
+        row["seat_number"]
+        for row in rows
+    ]
+
+
+# -------------------------------------------------------
+# SHOWTIME SEARCH AND THEATRE AVAILABILITY
+# -------------------------------------------------------
+
+def search_showtimes(
+    movie: str,
+    theatre: str,
+    date: str
+) -> dict:
+
+    selected_theatre = theatre.strip().lower()
+
+    supported_theatre = next(
+        (
+            item
+            for item in DEMO_THEATRES
+            if (
+                item["name"].lower() == selected_theatre
+                or (
+                    item["name"] == "AMB Cinemas"
+                    and selected_theatre == "amb"
+                )
+            )
+        ),
+        None
+    )
+
+    if not supported_theatre:
+
+        available_theatres = [
+            item["name"]
+            for item in DEMO_THEATRES
+            if item["available"]
+        ]
+
         return {
             "simulation": True,
             "available": False,
-            "message": "This demo currently supports AMB Cinemas only."
+            "requested_theatre": theatre,
+            "available_theatres": available_theatres,
+            "message": (
+                f"{theatre} is unavailable in this demo. "
+                f"Available theatres: "
+                f"{', '.join(available_theatres)}."
+            )
         }
+
+    sample_times = [
+        "6:30 PM",
+        "7:00 PM",
+        "9:30 PM"
+    ]
+
+    showtimes = []
+
+    for show_time in sample_times:
+
+        show_key = make_show_key(
+            movie,
+            supported_theatre["name"],
+            date,
+            show_time
+        )
+
+        showtimes.append({
+            "show_id": show_key,
+            "time": show_time
+        })
 
     return {
         "simulation": True,
         "available": True,
         "movie": movie,
-        "theatre": "AMB Cinemas",
+        "theatre": supported_theatre["name"],
         "date": date,
-        "showtimes": [
-            {"show_id": "AMB-1830", "time": "6:30 PM"},
-            {"show_id": "AMB-1900", "time": "7:00 PM"},
-            {"show_id": "AMB-2130", "time": "9:30 PM"}
+        "showtimes": showtimes,
+        "available_theatres": [
+            item["name"]
+            for item in DEMO_THEATRES
+            if item["available"]
         ]
     }
 
+
+# -------------------------------------------------------
+# DYNAMIC SEAT AVAILABILITY
+# -------------------------------------------------------
 
 def check_seat_availability(
     show_id: str,
     tickets: int,
     seat_preference: str
 ) -> dict:
-    """
-    Check sample seat availability.
-    This does not reserve or hold real seats.
-    """
 
     try:
         tickets = int(tickets)
     except (TypeError, ValueError):
+
         return {
             "simulation": True,
             "available": False,
@@ -116,34 +311,47 @@ def check_seat_availability(
         }
 
     if tickets < 1 or tickets > 6:
+
         return {
             "simulation": True,
             "available": False,
             "message": "Choose between 1 and 6 tickets."
         }
 
-    seats_by_preference = {
-        "front": ["F1", "F2", "F3", "F4"],
-        "middle": ["M5", "M6", "M7", "M8"],
-        "back": ["B1", "B2", "B3", "B4"]
-    }
+    preference = (
+        seat_preference or "middle"
+    ).strip().lower()
 
-    preference = (seat_preference or "middle").strip().lower()
+    if preference not in SEATS_BY_PREFERENCE:
 
-    if preference not in seats_by_preference:
         return {
             "simulation": True,
             "available": False,
             "message": "Choose front, middle or back seating."
         }
 
-    available_seats = seats_by_preference[preference]
+    all_seats = SEATS_BY_PREFERENCE[preference]
 
-    if tickets > len(available_seats):
+    booked_seats = set(
+        get_booked_seats(show_id)
+    )
+
+    available_seats = [
+        seat
+        for seat in all_seats
+        if seat not in booked_seats
+    ]
+
+    if len(available_seats) < tickets:
+
         return {
             "simulation": True,
             "available": False,
-            "message": "Not enough seats available."
+            "message": (
+                f"Only {len(available_seats)} seats are available "
+                f"in the {preference} section."
+            ),
+            "available_count": len(available_seats)
         }
 
     return {
@@ -152,9 +360,15 @@ def check_seat_availability(
         "show_id": show_id,
         "seat_preference": preference,
         "selected_seats": available_seats[:tickets],
-        "ticket_count": tickets
+        "ticket_count": tickets,
+        "available_count": len(available_seats),
+        "booked_seats": sorted(booked_seats)
     }
 
+
+# -------------------------------------------------------
+# CREATE SIMULATED BOOKING
+# -------------------------------------------------------
 
 def create_simulated_booking(
     movie: str,
@@ -165,18 +379,21 @@ def create_simulated_booking(
     seats: list[str],
     show_id: str
 ) -> dict:
-    """
-    Create a simulated booking after explicit confirmation.
-    This does not book real cinema tickets.
-    """
 
-    if tickets < 1 or tickets > 6 or len(seats) != tickets:
+    if (
+        tickets < 1
+        or tickets > 6
+        or len(seats) != tickets
+        or len(set(seats)) != len(seats)
+    ):
         return {
             "success": False,
             "message": "Invalid ticket or seat details."
         }
 
-    booking_id = f"CM-{uuid.uuid4().hex[:8].upper()}"
+    booking_id = (
+        f"CM-{uuid.uuid4().hex[:8].upper()}"
+    )
 
     booking = {
         "booking_id": booking_id,
@@ -191,17 +408,70 @@ def create_simulated_booking(
         "simulation": True
     }
 
-    simulated_bookings[booking_id] = booking
+    try:
 
-    return {
-        "success": True,
-        "booking": booking,
-        "message": "Simulated booking created successfully."
-    }
+        with get_db() as connection:
+
+            for seat in seats:
+
+                connection.execute(
+                    """
+                    INSERT INTO booked_seats (
+                        show_key,
+                        seat_number,
+                        booking_id
+                    )
+                    VALUES (%s, %s, %s)
+                    """,
+                    (
+                        show_id,
+                        seat,
+                        booking_id
+                    )
+                )
+
+            connection.execute(
+                """
+                INSERT INTO simulated_bookings (
+                    booking_id,
+                    booking_data
+                )
+                VALUES (%s, %s::jsonb)
+                """,
+                (
+                    booking_id,
+                    json.dumps(booking)
+                )
+            )
+
+        return {
+            "success": True,
+            "booking": booking,
+            "message": "Simulated booking created successfully."
+        }
+
+    except UniqueViolation:
+
+        return {
+            "success": False,
+            "message": (
+                "One or more selected seats were just booked. "
+                "Please check availability again."
+            )
+        }
+
+    except Exception as error:
+
+        print("Database booking error:", str(error))
+
+        return {
+            "success": False,
+            "message": "Database booking failed."
+        }
 
 
 # -------------------------------------------------------
-# GEMINI AGENT RUNNER
+# GEMINI BOOKING AGENT
 # -------------------------------------------------------
 
 def run_booking_agent(booking: dict) -> str:
@@ -216,38 +486,156 @@ Your task is to prepare a simulated booking summary.
 
 Follow these steps:
 
-1. Call search_showtimes using the movie, theatre and date.
-2. Inspect the returned showtimes.
-3. Find the show whose time matches the user's requested time.
-4. If no matching show exists, explain that the requested show is unavailable.
-5. If a matching show exists, call check_seat_availability using its
-   show_id, ticket count and seat preference.
-6. Inspect the seat availability result.
-7. If seats are available, present the booking summary and ask the user
-   to confirm before a simulated booking record is created.
-8. Never claim that real tickets were purchased, reserved or held.
-9. Never invent showtimes or seat numbers.
+1. Inspect the booking details.
+2. Confirm the selected theatre and showtime.
+3. Never invent showtimes or seat numbers.
+4. Never claim that real tickets were purchased, reserved or held.
+5. Clearly state that showtimes and seats are simulated demo data.
+6. Ask the user to select seats before final confirmation.
+"""
 
-Clearly state that showtimes and seats are simulated demo data.
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt
+    )
+
+    return (
+        response.text
+        or "Booking summary could not be generated."
+    )
+
+
+# -------------------------------------------------------
+# OMDB MOVIE DETAILS
+# -------------------------------------------------------
+
+def get_verified_movie_details(title: str) -> dict | None:
+
+    if not OMDB_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="OMDb API key is missing."
+        )
+
+    params = urlencode({
+        "t": title,
+        "type": "movie",
+        "plot": "short",
+        "apikey": OMDB_API_KEY
+    })
+
+    url = f"https://www.omdbapi.com/?{params}"
+
+    try:
+
+        with urlopen(url, timeout=15) as response:
+
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        if data.get("Response") != "True":
+            return None
+
+        return {
+            "Title": data.get("Title"),
+            "Year": data.get("Year"),
+            "imdbID": data.get("imdbID"),
+            "Type": data.get("Type"),
+            "Poster": data.get("Poster"),
+            "Genre": data.get("Genre"),
+            "Plot": data.get("Plot"),
+            "imdbRating": data.get("imdbRating"),
+            "Language": data.get("Language"),
+            "Runtime": data.get("Runtime")
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+
+        print("OMDb recommendation lookup error:", str(error))
+
+        return None
+
+
+# -------------------------------------------------------
+# AI MOVIE RECOMMENDATIONS
+# -------------------------------------------------------
+
+def generate_movie_recommendations(
+    mood: str,
+    language: str,
+    genre: str
+) -> list[dict]:
+
+    prompt = f"""
+You are CineMate AI, a movie recommendation expert.
+
+Recommend 8 real and released movies based on:
+
+Mood: {mood}
+Language: {language}
+Genre: {genre}
+
+Rules:
+1. Recommend real released movies only.
+2. Match the preferences as closely as possible.
+3. Do not invent movie titles.
+4. Return movie titles only.
+5. Avoid duplicates.
+6. Respect the language preference.
+
+Return ONLY JSON:
+
+{{
+    "movies": [
+        "Movie Title 1",
+        "Movie Title 2"
+    ]
+}}
 """
 
     response = client.models.generate_content(
         model="gemini-3.5-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
-            tools=[
-                search_showtimes,
-                check_seat_availability
-            ],
-            automatic_function_calling=(
-                types.AutomaticFunctionCallingConfig(
-                    maximum_remote_calls=5
-                )
-            )
+            response_mime_type="application/json"
         )
     )
 
-    return response.text or "Booking summary could not be generated."
+    result = json.loads(
+        response.text or "{}"
+    )
+
+    titles = result.get("movies", [])
+
+    if not isinstance(titles, list):
+        return []
+
+    verified_movies = []
+    seen_ids = set()
+
+    for title in titles[:8]:
+
+        if not isinstance(title, str) or not title.strip():
+            continue
+
+        movie = get_verified_movie_details(title.strip())
+
+        if not movie:
+            continue
+
+        imdb_id = movie.get("imdbID")
+
+        if not imdb_id or imdb_id in seen_ids:
+            continue
+
+        seen_ids.add(imdb_id)
+        verified_movies.append(movie)
+
+    return verified_movies
 
 
 # -------------------------------------------------------
@@ -256,6 +644,7 @@ Clearly state that showtimes and seats are simulated demo data.
 
 @app.get("/")
 def home():
+
     return {
         "message": "Welcome to CineMate AI Backend!",
         "status": "Running"
@@ -264,10 +653,43 @@ def home():
 
 @app.get("/health")
 def health_check():
+
     return {
         "status": "healthy",
         "project": "CineMate AI"
     }
+
+
+# -------------------------------------------------------
+# DATABASE HEALTH CHECK
+# -------------------------------------------------------
+
+@app.get("/health/database")
+def database_health_check():
+
+    try:
+
+        with get_db() as connection:
+
+            row = connection.execute(
+                "SELECT current_database() AS database"
+            ).fetchone()
+
+        return {
+            "status": "connected",
+            "database": row["database"],
+            "provider": "PostgreSQL",
+            "simulation": True
+        }
+
+    except Exception as error:
+
+        print("Database health check error:", str(error))
+
+        raise HTTPException(
+            status_code=503,
+            detail="PostgreSQL database connection failed."
+        )
 
 
 # -------------------------------------------------------
@@ -277,9 +699,7 @@ def health_check():
 @app.get("/api/movies/search")
 def search_movies(title: str):
 
-    omdb_api_key = os.getenv("OMDB_API_KEY")
-
-    if not omdb_api_key:
+    if not OMDB_API_KEY:
         raise HTTPException(
             status_code=500,
             detail="OMDb API key is missing."
@@ -288,21 +708,79 @@ def search_movies(title: str):
     params = urlencode({
         "s": title,
         "type": "movie",
-        "apikey": omdb_api_key
+        "apikey": OMDB_API_KEY
     })
 
     url = f"https://www.omdbapi.com/?{params}"
 
     try:
+
         with urlopen(url, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
+
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
 
         return data
 
     except Exception as error:
+
         raise HTTPException(
             status_code=502,
             detail=f"OMDb request failed: {str(error)}"
+        )
+
+
+# -------------------------------------------------------
+# AI MOVIE RECOMMENDATION API
+# -------------------------------------------------------
+
+@app.post("/api/movies/recommend")
+def recommend_movies(request: MovieRecommendationRequest):
+
+    mood = request.mood.strip()
+    language = request.language.strip() or "Any"
+    genre = request.genre.strip() or "Any"
+
+    if not mood:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select a mood."
+        )
+
+    try:
+
+        movies = generate_movie_recommendations(
+            mood=mood,
+            language=language,
+            genre=genre
+        )
+
+        return {
+            "status": "success",
+            "preferences": {
+                "mood": mood,
+                "language": language,
+                "genre": genre
+            },
+            "count": len(movies),
+            "movies": movies,
+            "message": (
+                "AI recommendations generated and movie details "
+                "verified using OMDb."
+            )
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+
+        print("Movie recommendation error:", str(error))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to generate movie recommendations."
         )
 
 
@@ -314,7 +792,9 @@ def search_movies(title: str):
 def create_booking(request: BookingRequest):
 
     try:
+
         session_id = request.session_id.strip()
+        user_message = request.prompt.strip()
 
         if not session_id:
             raise HTTPException(
@@ -330,47 +810,76 @@ def create_booking(request: BookingRequest):
                 "time": None,
                 "theatre": None,
                 "tickets": None,
-                "seat_preference": None
+                "seat_preference": None,
+                "awaiting_theatre_selection": False,
+                "available_theatres": []
             }
         )
 
-        # Do not modify an already-confirmed session.
         if previous_booking.get("confirmed_booking"):
+
             return {
                 "status": "success",
-                "booking": previous_booking,
-                "message": (
-                    "This session already has a confirmed "
-                    "simulated booking."
+                "booking": previous_booking
+            }
+
+        # HANDLE YES AFTER THEATRE ALTERNATIVE PROMPT
+
+        if (
+            previous_booking.get("awaiting_theatre_selection")
+            and len(previous_booking.get("available_theatres", [])) == 1
+            and user_message.lower() in [
+                "yes", "yeah", "ok", "okay",
+                "sure", "select it", "choose it"
+            ]
+        ):
+
+            selected_theatre = (
+                previous_booking["available_theatres"][0]
+            )
+
+            booking_data = {
+                "movie": previous_booking.get("movie"),
+                "date": previous_booking.get("date"),
+                "time": previous_booking.get("time"),
+                "theatre": selected_theatre,
+                "tickets": previous_booking.get("tickets"),
+                "seat_preference": previous_booking.get(
+                    "seat_preference"
+                ),
+                "missing_details": [],
+                "ready_to_book": True,
+                "reply": (
+                    f"You selected {selected_theatre}. "
+                    "Checking the showtime now."
                 )
             }
 
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=f"""
+        else:
+
+            response = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=f"""
 You are CineMate AI, a movie booking assistant.
 
-Previous booking details:
+Previous booking:
 {json.dumps(previous_booking)}
 
 New user message:
-{request.prompt}
+{user_message}
 
-Update the existing booking using the new user message.
+Update the booking.
 
-IMPORTANT RULES:
-
-1. Preserve previous details unless the user changes them.
-2. Extract new information from the latest user message.
-3. Never invent movie, theatre, date or showtime details.
+Rules:
+1. Preserve previous details unless changed.
+2. Extract new details from the user message.
+3. Never invent details.
 4. Required fields: movie, date, time, theatre, tickets.
-5. Seat preference is optional. If not provided, keep it null.
-6. Ask only for details that are still missing.
-7. Set ready_to_book true only when all required fields exist.
-8. Do not claim that a real booking has been completed.
-9. Return tickets as a number when provided.
+5. Seat preference is optional.
+6. Ask only for missing details.
+7. Return tickets as a number.
 
-Return ONLY valid JSON in this format:
+Return ONLY JSON:
 
 {{
   "movie": null,
@@ -381,15 +890,17 @@ Return ONLY valid JSON in this format:
   "seat_preference": null,
   "missing_details": [],
   "ready_to_book": false,
-  "reply": "Friendly response to the user"
+  "reply": "Friendly response"
 }}
 """,
-            config={
-                "response_mime_type": "application/json"
-            }
-        )
+                config={
+                    "response_mime_type": "application/json"
+                }
+            )
 
-        booking_data = json.loads(response.text)
+            booking_data = json.loads(response.text)
+
+        # PRESERVE PREVIOUS DETAILS
 
         fields = [
             "movie",
@@ -400,13 +911,13 @@ Return ONLY valid JSON in this format:
             "seat_preference"
         ]
 
-        # Preserve existing values when Gemini returns null.
         for field in fields:
+
             if booking_data.get(field) is None:
                 booking_data[field] = previous_booking.get(field)
 
-        # Ensure ticket count is an integer.
         if booking_data.get("tickets") is not None:
+
             try:
                 booking_data["tickets"] = int(
                     booking_data["tickets"]
@@ -415,11 +926,7 @@ Return ONLY valid JSON in this format:
                 booking_data["tickets"] = None
 
         required_fields = [
-            "movie",
-            "date",
-            "time",
-            "theatre",
-            "tickets"
+            "movie", "date", "time", "theatre", "tickets"
         ]
 
         booking_data["missing_details"] = [
@@ -432,35 +939,155 @@ Return ONLY valid JSON in this format:
             len(booking_data["missing_details"]) == 0
         )
 
-        # Save booking details.
+        if not booking_data["ready_to_book"]:
+
+            booking_sessions[session_id] = {
+                **{
+                    field: booking_data.get(field)
+                    for field in fields
+                },
+                "awaiting_theatre_selection": False,
+                "available_theatres": []
+            }
+
+            return {
+                "status": "success",
+                "booking": booking_data
+            }
+
+        # CHECK THEATRE
+
+        showtime_result = search_showtimes(
+            movie=booking_data["movie"],
+            theatre=booking_data["theatre"],
+            date=booking_data["date"]
+        )
+
+        if not showtime_result.get("available"):
+
+            available_theatres = (
+                showtime_result.get("available_theatres", [])
+            )
+
+            booking_data["ready_to_book"] = False
+            booking_data["show_id"] = None
+            booking_data["available_theatres"] = available_theatres
+            booking_data["missing_details"] = [
+                "theatre_selection"
+            ]
+
+            if available_theatres:
+
+                booking_data["reply"] = (
+                    f"{booking_data['theatre']} is unavailable. "
+                    "Available demo theatres: "
+                    f"{', '.join(available_theatres)}. "
+                    "Would you like to select "
+                    f"{available_theatres[0]}?"
+                )
+
+            else:
+
+                booking_data["reply"] = (
+                    "No supported demo theatres are available."
+                )
+
+            booking_sessions[session_id] = {
+                **{
+                    field: booking_data.get(field)
+                    for field in fields
+                },
+                "awaiting_theatre_selection": bool(
+                    available_theatres
+                ),
+                "available_theatres": available_theatres
+            }
+
+            return {
+                "status": "success",
+                "booking": booking_data
+            }
+
+        # MATCH SHOWTIME
+
+        requested_time = normalize_time(
+            str(booking_data["time"])
+        )
+
+        selected_show = next(
+            (
+                show
+                for show in showtime_result["showtimes"]
+                if normalize_time(show["time"]) == requested_time
+            ),
+            None
+        )
+
+        if not selected_show:
+
+            available_times = [
+                show["time"]
+                for show in showtime_result["showtimes"]
+            ]
+
+            booking_data["ready_to_book"] = False
+            booking_data["available_showtimes"] = available_times
+            booking_data["missing_details"] = [
+                "showtime_selection"
+            ]
+
+            booking_data["reply"] = (
+                "Requested showtime unavailable. Available times: "
+                f"{', '.join(available_times)}."
+            )
+
+            booking_sessions[session_id] = {
+                **{
+                    field: booking_data.get(field)
+                    for field in fields
+                },
+                "awaiting_theatre_selection": False,
+                "available_theatres": []
+            }
+
+            return {
+                "status": "success",
+                "booking": booking_data
+            }
+
+        # VALID SHOW
+
+        booking_data["theatre"] = showtime_result["theatre"]
+        booking_data["time"] = selected_show["time"]
+        booking_data["show_id"] = selected_show["show_id"]
+        booking_data["available_theatres"] = (
+            showtime_result["available_theatres"]
+        )
+
+        booking_data["agent_response"] = run_booking_agent(
+            booking_data
+        )
+
+        booking_data["ready_to_book"] = True
+        booking_data["missing_details"] = []
+
         booking_sessions[session_id] = {
-            field: booking_data.get(field)
-            for field in fields
+            **booking_data,
+            "awaiting_theatre_selection": False
         }
-
-        if booking_data["ready_to_book"]:
-
-            agent_response = run_booking_agent(booking_data)
-
-            booking_data["agent_response"] = agent_response
-
-            # Save complete booking details.
-            booking_sessions[session_id] = booking_data
 
         return {
             "status": "success",
-            "booking": booking_data,
-            **(
-                {"agent_response": booking_data["agent_response"]}
-                if booking_data.get("agent_response")
-                else {}
-            )
+            "booking": booking_data
         }
 
     except HTTPException:
         raise
 
     except Exception as error:
+
+        print("Booking conversation error:", str(error))
+
         raise HTTPException(
             status_code=500,
             detail=f"Gemini API error: {str(error)}"
@@ -471,21 +1098,11 @@ Return ONLY valid JSON in this format:
 # CONFIRM SIMULATED BOOKING
 # -------------------------------------------------------
 
-def normalize_time(value: str) -> str:
-    """Normalize values such as '7 PM' and '7:00 PM'."""
-
-    return (
-        value.strip()
-        .upper()
-        .replace(" ", "")
-        .replace(":00", "")
-    )
-
-
 @app.post("/api/booking/confirm")
 def confirm_booking(request: ConfirmBookingRequest):
 
     try:
+
         session_id = request.session_id.strip()
 
         if not session_id:
@@ -499,28 +1116,20 @@ def confirm_booking(request: ConfirmBookingRequest):
         if not booking:
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "Booking session not found. "
-                    "Please prepare the booking first."
-                )
+                detail="Booking session not found."
             )
 
-        # Prevent duplicate simulated bookings.
         if booking.get("confirmed_booking"):
+
             return {
                 "status": "success",
-                "message": "This simulated booking was already confirmed.",
+                "message": "This booking was already confirmed.",
                 "simulation": True,
                 "booking": booking["confirmed_booking"]
             }
 
-        # Validate required fields.
         required_fields = [
-            "movie",
-            "theatre",
-            "date",
-            "time",
-            "tickets"
+            "movie", "theatre", "date", "time", "tickets"
         ]
 
         missing_fields = [
@@ -538,10 +1147,8 @@ def confirm_booking(request: ConfirmBookingRequest):
                 }
             )
 
-        # Validate ticket count.
         try:
             tickets = int(booking["tickets"])
-
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400,
@@ -554,24 +1161,57 @@ def confirm_booking(request: ConfirmBookingRequest):
                 detail="Choose between 1 and 6 tickets."
             )
 
-        # Get seat preference from frontend.
         selected_preference = (
             request.seat_preference
             or booking.get("seat_preference")
             or "middle"
         ).strip().lower()
 
-        if selected_preference not in [
-            "front",
-            "middle",
-            "back"
-        ]:
+        if selected_preference not in SEATS_BY_PREFERENCE:
             raise HTTPException(
                 status_code=400,
                 detail="Choose front, middle or back seating."
             )
 
-        # Step 1: Search simulated showtimes.
+        selected_seats = request.selected_seats
+
+        if not selected_seats:
+            raise HTTPException(
+                status_code=400,
+                detail="Please select your seats before confirming."
+            )
+
+        if len(selected_seats) != tickets:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Please select exactly {tickets} seats."
+            )
+
+        if len(set(selected_seats)) != len(selected_seats):
+            raise HTTPException(
+                status_code=400,
+                detail="Duplicate seat selection is not allowed."
+            )
+
+        valid_section_seats = set(
+            SEATS_BY_PREFERENCE[selected_preference]
+        )
+
+        invalid_seats = [
+            seat
+            for seat in selected_seats
+            if seat not in valid_section_seats
+        ]
+
+        if invalid_seats:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Selected seats do not belong to the chosen section.",
+                    "invalid_seats": invalid_seats
+                }
+            )
+
         showtime_result = search_showtimes(
             movie=booking["movie"],
             theatre=booking["theatre"],
@@ -581,13 +1221,9 @@ def confirm_booking(request: ConfirmBookingRequest):
         if not showtime_result.get("available"):
             raise HTTPException(
                 status_code=400,
-                detail=showtime_result.get(
-                    "message",
-                    "No showtimes available."
-                )
+                detail="Selected theatre is unavailable."
             )
 
-        # Step 2: Find the requested showtime.
         requested_time = normalize_time(
             str(booking["time"])
         )
@@ -604,30 +1240,30 @@ def confirm_booking(request: ConfirmBookingRequest):
         if not selected_show:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Requested showtime is unavailable in this demo."
-                )
+                detail="Requested showtime is unavailable."
             )
 
-        # Step 3: Check simulated seat availability.
-        seat_result = check_seat_availability(
-            show_id=selected_show["show_id"],
-            tickets=tickets,
-            seat_preference=selected_preference
+        show_id = selected_show["show_id"]
+
+        booked_seats = set(
+            get_booked_seats(show_id)
         )
 
-        if not seat_result.get("available"):
+        unavailable_seats = [
+            seat
+            for seat in selected_seats
+            if seat in booked_seats
+        ]
+
+        if unavailable_seats:
             raise HTTPException(
-                status_code=400,
-                detail=seat_result.get(
-                    "message",
-                    "Requested seats are unavailable."
-                )
+                status_code=409,
+                detail={
+                    "message": "Some selected seats are no longer available.",
+                    "unavailable_seats": unavailable_seats
+                }
             )
 
-        selected_seats = seat_result["selected_seats"]
-
-        # Step 4: Create simulated booking.
         result = create_simulated_booking(
             movie=booking["movie"],
             theatre=booking["theatre"],
@@ -635,19 +1271,15 @@ def confirm_booking(request: ConfirmBookingRequest):
             time=selected_show["time"],
             tickets=tickets,
             seats=selected_seats,
-            show_id=selected_show["show_id"]
+            show_id=show_id
         )
 
         if not result.get("success"):
             raise HTTPException(
-                status_code=400,
-                detail=result.get(
-                    "message",
-                    "Simulated booking failed."
-                )
+                status_code=409,
+                detail=result.get("message", "Booking failed.")
             )
 
-        # Save confirmed booking.
         booking["seat_preference"] = selected_preference
         booking["confirmed_booking"] = result["booking"]
 
@@ -664,22 +1296,80 @@ def confirm_booking(request: ConfirmBookingRequest):
         raise
 
     except Exception as error:
+
+        print("Booking confirmation error:", str(error))
+
         raise HTTPException(
             status_code=500,
-            detail=f"Booking confirmation error: {str(error)}"
+            detail="Booking confirmation failed."
         )
 
 
 # -------------------------------------------------------
-# LOOK UP A SIMULATED BOOKING
+# GET SEAT AVAILABILITY
+# -------------------------------------------------------
+
+@app.get("/api/seats/{show_id}")
+def get_seat_availability(show_id: str):
+
+    if (
+        len(show_id) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in show_id
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid show ID."
+        )
+
+    booked = set(
+        get_booked_seats(show_id)
+    )
+
+    return {
+        "status": "success",
+        "simulation": True,
+        "show_id": show_id,
+        "sections": {
+            preference: {
+                "total": len(seats),
+                "available": [
+                    seat
+                    for seat in seats
+                    if seat not in booked
+                ],
+                "booked": [
+                    seat
+                    for seat in seats
+                    if seat in booked
+                ]
+            }
+            for preference, seats in SEATS_BY_PREFERENCE.items()
+        }
+    }
+
+
+# -------------------------------------------------------
+# LOOK UP SIMULATED BOOKING
 # -------------------------------------------------------
 
 @app.get("/api/booking/{booking_id}")
 def get_simulated_booking(booking_id: str):
 
-    booking = simulated_bookings.get(booking_id)
+    with get_db() as connection:
 
-    if not booking:
+        row = connection.execute(
+            """
+            SELECT booking_data
+            FROM simulated_bookings
+            WHERE booking_id = %s
+            """,
+            (booking_id,)
+        ).fetchone()
+
+    if not row:
         raise HTTPException(
             status_code=404,
             detail="Simulated booking not found."
@@ -688,5 +1378,5 @@ def get_simulated_booking(booking_id: str):
     return {
         "status": "success",
         "simulation": True,
-        "booking": booking
+        "booking": row["booking_data"]
     }
