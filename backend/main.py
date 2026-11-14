@@ -1,4 +1,6 @@
-
+import json
+from urllib.parse import urlencode
+from urllib.request import urlopen
 import os
 import json
 
@@ -57,6 +59,28 @@ def health_check():
         "status": "healthy",
         "project": "CineMate AI"
     }
+
+@app.get("/api/movies/search")
+def search_movies(title: str):
+    api_key = os.getenv("OMDB_API_KEY")
+    print("OMDb API key loaded:", bool(api_key))
+
+    if not api_key:
+        return {"error": "OMDb API key is missing"}
+
+    params = urlencode({
+        "s": title,
+        "type": "movie",
+        "apikey": api_key
+    })
+
+    url = f"https://www.omdbapi.com/?{params}"
+
+    with urlopen(url) as response:
+        data = json.loads(response.read().decode("utf-8"))
+        print("OMDb response:", data)
+
+    return data
 
 
 @app.post("/api/booking")

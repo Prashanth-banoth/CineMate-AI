@@ -20,19 +20,79 @@ type Message = {
   text: string;
 };
 
+type Movie = {
+  Title: string;
+  Year: string;
+  imdbID: string;
+  Type: string;
+  Poster: string;
+};
+
+const API_URL = "https://cinemate-ai-backend.onrender.com";
+
 export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [booking, setBooking] = useState<Booking | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const [sessionId] = useState(
-    () => `session-${Date.now()}`
-  );
+  const [sessionId] = useState(() => `session-${Date.now()}`);
 
   const [seatPreference, setSeatPreference] = useState("Middle");
   const [confirmed, setConfirmed] = useState(false);
   const [bookingId, setBookingId] = useState("");
+
+  // Movie search states
+  const [movieTitle, setMovieTitle] = useState("");
+  const [movies, setMovies] = useState<Movie[]>([]);
+  const [movieLoading, setMovieLoading] = useState(false);
+  const [movieError, setMovieError] = useState("");
+
+  async function searchMovies() {
+    if (!movieTitle.trim() || movieLoading) return;
+
+    setMovieLoading(true);
+    setMovieError("");
+    setMovies([]);
+
+    try {
+      const res = await fetch(
+        `${API_URL}/api/movies/search?title=${encodeURIComponent(movieTitle.trim())}`
+      );
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.detail || "Movie search failed.");
+      }
+
+      if (data.Response === "False") {
+        setMovieError(data.Error || "No movies found.");
+        return;
+      }
+
+      setMovies(data.Search || []);
+    } catch (error) {
+      setMovieError(
+        error instanceof Error
+          ? error.message
+          : "Unable to connect to movie search."
+      );
+    } finally {
+      setMovieLoading(false);
+    }
+  }
+
+  function selectMovie(movie: Movie) {
+    setPrompt(`I want to book tickets for ${movie.Title}`);
+    setMovieTitle(movie.Title);
+    setMessages((previous) => [
+      ...previous,
+      { role: "ai", text: `${movie.Title} selected. Now tell me your booking details.` },
+    ]);
+
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 
   async function handleBooking() {
     if (!prompt.trim() || loading || confirmed) return;
@@ -48,7 +108,7 @@ export default function Home() {
     setLoading(true);
 
     try {
-      const res = await fetch("https://cinemate-ai-backend.onrender.com/api/booking", {
+      const res = await fetch(`${API_URL}/api/booking`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -124,9 +184,88 @@ export default function Home() {
           </h2>
 
           <p className="mx-auto mt-6 max-w-2xl text-gray-400">
-            Tell CineMate what you want to watch. Your AI assistant
-            will help organize your movie booking.
+            Discover movies and tell CineMate what you want to watch.
+            Your AI assistant will help organize your movie booking.
           </p>
+        </div>
+
+        {/* Movie Search Section */}
+        <div className="mt-12 rounded-2xl border border-white/10 bg-[#111827] p-6">
+          <div className="mb-5">
+            <h3 className="text-xl font-semibold">🎬 Discover Movies</h3>
+            <p className="mt-2 text-sm text-gray-400">
+              Search movies by title and explore their posters and release years.
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-3 sm:flex-row">
+            <input
+              type="text"
+              value={movieTitle}
+              onChange={(e) => setMovieTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") searchMovies();
+              }}
+              placeholder="Search a movie... e.g. Pushpa 2"
+              className="min-w-0 flex-1 rounded-xl border border-white/10 bg-[#080B14] px-4 py-3 text-sm outline-none focus:border-violet-400"
+            />
+
+            <button
+              onClick={searchMovies}
+              disabled={movieLoading || !movieTitle.trim()}
+              className="rounded-xl bg-violet-600 px-6 py-3 font-semibold transition hover:bg-violet-500 disabled:opacity-50"
+            >
+              {movieLoading ? "Searching..." : "Search Movies"}
+            </button>
+          </div>
+
+          {movieError && (
+            <p className="mt-5 rounded-lg border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-300">
+              {movieError}
+            </p>
+          )}
+
+          {movies.length > 0 && (
+            <div className="mt-7 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+              {movies.map((movie) => (
+                <div
+                  key={movie.imdbID}
+                  className="overflow-hidden rounded-xl border border-white/10 bg-[#080B14]"
+                >
+                  {movie.Poster && movie.Poster !== "N/A" ? (
+                    <img
+                      src={movie.Poster}
+                      alt={movie.Title}
+                      className="h-64 w-full object-contain bg-black"
+                    />
+                  ) : (
+                    <div className="flex h-64 items-center justify-center bg-[#1a2030] text-gray-500">
+                      No poster available
+                    </div>
+                  )}
+
+                  <div className="p-4">
+                    <h4 className="font-semibold">{movie.Title}</h4>
+
+                    <p className="mt-2 text-sm text-gray-400">
+                      Release Year: {movie.Year}
+                    </p>
+
+                    <p className="mt-1 text-xs text-gray-500">
+                      IMDb ID: {movie.imdbID}
+                    </p>
+
+                    <button
+                      onClick={() => selectMovie(movie)}
+                      className="mt-4 w-full rounded-lg bg-violet-600 py-2 text-sm font-semibold transition hover:bg-violet-500"
+                    >
+                      Select Movie →
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {confirmed ? (
@@ -142,9 +281,7 @@ export default function Home() {
             </p>
 
             <div className="mt-6 rounded-xl bg-[#080B14] p-5">
-              <p className="text-sm text-gray-400">
-                Booking ID
-              </p>
+              <p className="text-sm text-gray-400">Booking ID</p>
               <p className="mt-2 text-2xl font-bold text-violet-400">
                 {bookingId}
               </p>
@@ -163,6 +300,7 @@ export default function Home() {
           </div>
         ) : (
           <div className="mt-12 grid gap-8 md:grid-cols-2">
+            {/* AI Chat */}
             <div className="rounded-2xl border border-white/10 bg-[#111827] p-5">
               <h3 className="mb-5 text-lg font-semibold">
                 Movie Assistant
@@ -171,7 +309,7 @@ export default function Home() {
               <div className="mb-5 max-h-80 space-y-4 overflow-y-auto">
                 {messages.length === 0 && (
                   <p className="text-sm leading-7 text-gray-400">
-                    Hello! I'm CineMate AI. Tell me your movie booking
+                    Hello! I&apos;m CineMate AI. Tell me your movie booking
                     requirements to get started.
                   </p>
                 )}
@@ -223,6 +361,7 @@ export default function Home() {
               </button>
             </div>
 
+            {/* Booking Summary */}
             <div className="rounded-2xl border border-white/10 bg-[#111827] p-5">
               <h3 className="mb-6 text-lg font-semibold">
                 Booking Summary
