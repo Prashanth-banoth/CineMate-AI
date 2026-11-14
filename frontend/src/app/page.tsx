@@ -1,4 +1,3 @@
-
 "use client";
 
 import { useState } from "react";
@@ -13,6 +12,7 @@ type Booking = {
   missing_details: string[];
   ready_to_book: boolean;
   reply: string;
+  agent_response?: string;
 };
 
 type Message = {
@@ -28,6 +28,19 @@ type Movie = {
   Poster: string;
 };
 
+type ConfirmedBooking = {
+  booking_id: string;
+  movie: string;
+  theatre: string;
+  date: string;
+  time: string;
+  tickets: number;
+  seats: string[];
+  show_id: string;
+  status: string;
+  simulation: boolean;
+};
+
 const API_URL = "https://cinemate-ai-backend.onrender.com";
 
 export default function Home() {
@@ -35,12 +48,14 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [booking, setBooking] = useState<Booking | null>(null);
   const [loading, setLoading] = useState(false);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const [sessionId] = useState(() => `session-${Date.now()}`);
 
   const [seatPreference, setSeatPreference] = useState("Middle");
-  const [confirmed, setConfirmed] = useState(false);
-  const [bookingId, setBookingId] = useState("");
+  const [confirmedBooking, setConfirmedBooking] =
+    useState<ConfirmedBooking | null>(null);
 
   // Movie search states
   const [movieTitle, setMovieTitle] = useState("");
@@ -57,7 +72,9 @@ export default function Home() {
 
     try {
       const res = await fetch(
-        `${API_URL}/api/movies/search?title=${encodeURIComponent(movieTitle.trim())}`
+        `${API_URL}/api/movies/search?title=${encodeURIComponent(
+          movieTitle.trim()
+        )}`
       );
 
       const data = await res.json();
@@ -88,14 +105,17 @@ export default function Home() {
     setMovieTitle(movie.Title);
     setMessages((previous) => [
       ...previous,
-      { role: "ai", text: `${movie.Title} selected. Now tell me your booking details.` },
+      {
+        role: "ai",
+        text: `${movie.Title} selected. Now tell me your booking details.`,
+      },
     ]);
 
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   async function handleBooking() {
-    if (!prompt.trim() || loading || confirmed) return;
+    if (!prompt.trim() || loading || confirmLoading || confirmedBooking) return;
 
     const userPrompt = prompt.trim();
 
@@ -106,6 +126,7 @@ export default function Home() {
 
     setPrompt("");
     setLoading(true);
+    setError("");
 
     try {
       const res = await fetch(`${API_URL}/api/booking`, {
@@ -122,40 +143,106 @@ export default function Home() {
       const data = await res.json();
 
       if (!res.ok) {
-        throw new Error(data.detail || "Something went wrong");
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : "Something went wrong while preparing your booking."
+        );
       }
 
       const bookingData: Booking = data.booking;
 
       setBooking(bookingData);
 
-      setMessages((previous) => [
-        ...previous,
-        { role: "ai", text: bookingData.reply },
-      ]);
-    } catch (error) {
+      if (bookingData.seat_preference) {
+        const preference =
+          bookingData.seat_preference.charAt(0).toUpperCase() +
+          bookingData.seat_preference.slice(1).toLowerCase();
+        setSeatPreference(preference);
+      }
+
       setMessages((previous) => [
         ...previous,
         {
           role: "ai",
           text:
-            error instanceof Error
-              ? error.message
-              : "Unable to connect to CineMate AI.",
+            bookingData.reply ||
+            data.agent_response ||
+            "I have updated your booking details.",
         },
+      ]);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to connect to CineMate AI.";
+
+      setError(message);
+      setMessages((previous) => [
+        ...previous,
+        { role: "ai", text: message },
       ]);
     } finally {
       setLoading(false);
     }
   }
 
-  function confirmBooking() {
-    if (!booking?.ready_to_book || confirmed) return;
+  async function confirmBooking() {
+    if (
+      !booking?.ready_to_book ||
+      confirmLoading ||
+      confirmedBooking
+    ) {
+      return;
+    }
 
-    const id = `CM-${Date.now().toString().slice(-8)}`;
+    setConfirmLoading(true);
+    setError("");
 
-    setBookingId(id);
-    setConfirmed(true);
+    try {
+      const res = await fetch(`${API_URL}/api/booking/confirm`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          session_id: sessionId,
+          seat_preference: seatPreference.toLowerCase(),
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : data.detail?.message || "Booking confirmation failed."
+        );
+      }
+
+      const result: ConfirmedBooking = data.booking;
+
+      setConfirmedBooking(result);
+
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "ai",
+          text: `Your simulated booking is confirmed. Booking ID: ${result.booking_id}. Selected seats: ${result.seats.join(
+            ", "
+          )}.`,
+        },
+      ]);
+    } catch (error) {
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Unable to confirm the simulated booking."
+      );
+    } finally {
+      setConfirmLoading(false);
+    }
   }
 
   return (
@@ -236,7 +323,7 @@ export default function Home() {
                     <img
                       src={movie.Poster}
                       alt={movie.Title}
-                      className="h-64 w-full object-contain bg-black"
+                      className="h-64 w-full bg-black object-contain"
                     />
                   ) : (
                     <div className="flex h-64 items-center justify-center bg-[#1a2030] text-gray-500">
@@ -268,43 +355,50 @@ export default function Home() {
           )}
         </div>
 
-        {confirmed ? (
+        {confirmedBooking ? (
           <div className="mx-auto mt-12 max-w-xl rounded-2xl border border-green-400/30 bg-[#111827] p-8 text-center">
             <div className="text-5xl">🎉</div>
 
             <h2 className="mt-5 text-2xl font-bold text-green-400">
-              Booking Confirmed!
+              Simulated Booking Confirmed!
             </h2>
 
             <p className="mt-3 text-gray-400">
-              Your simulated movie booking has been created successfully.
+              CineMate has created your demo booking record.
             </p>
 
             <div className="mt-6 rounded-xl bg-[#080B14] p-5">
               <p className="text-sm text-gray-400">Booking ID</p>
               <p className="mt-2 text-2xl font-bold text-violet-400">
-                {bookingId}
+                {confirmedBooking.booking_id}
               </p>
             </div>
 
             <div className="mt-5 space-y-2 text-sm text-gray-300">
-              <p>{booking?.movie}</p>
-              <p>{booking?.theatre}</p>
-              <p>{booking?.date} · {booking?.time}</p>
-              <p>{booking?.tickets} Tickets · {seatPreference} seats</p>
+              <p>{confirmedBooking.movie}</p>
+              <p>{confirmedBooking.theatre}</p>
+              <p>
+                {confirmedBooking.date} · {confirmedBooking.time}
+              </p>
+              <p>
+                {confirmedBooking.tickets} Tickets · Seats:{" "}
+                {confirmedBooking.seats.join(", ")}
+              </p>
+              <p className="text-xs text-gray-500">
+                Status: {confirmedBooking.status}
+              </p>
             </div>
 
             <p className="mt-6 text-xs text-gray-500">
-              Demo confirmation only. No actual tickets have been booked.
+              Demo only. No actual cinema tickets have been booked, held or
+              paid for.
             </p>
           </div>
         ) : (
           <div className="mt-12 grid gap-8 md:grid-cols-2">
             {/* AI Chat */}
             <div className="rounded-2xl border border-white/10 bg-[#111827] p-5">
-              <h3 className="mb-5 text-lg font-semibold">
-                Movie Assistant
-              </h3>
+              <h3 className="mb-5 text-lg font-semibold">Movie Assistant</h3>
 
               <div className="mb-5 max-h-80 space-y-4 overflow-y-auto">
                 {messages.length === 0 && (
@@ -337,6 +431,12 @@ export default function Home() {
                     CineMate AI is thinking...
                   </p>
                 )}
+
+                {confirmLoading && (
+                  <p className="text-sm text-green-300">
+                    Confirming your simulated booking...
+                  </p>
+                )}
               </div>
 
               <textarea
@@ -354,7 +454,12 @@ export default function Home() {
 
               <button
                 onClick={handleBooking}
-                disabled={loading || !prompt.trim()}
+                disabled={
+                  loading ||
+                  confirmLoading ||
+                  !prompt.trim() ||
+                  Boolean(confirmedBooking)
+                }
                 className="mt-3 w-full rounded-xl bg-violet-600 py-3 font-semibold transition hover:bg-violet-500 disabled:opacity-50"
               >
                 {loading ? "Processing..." : "Send Message →"}
@@ -363,9 +468,7 @@ export default function Home() {
 
             {/* Booking Summary */}
             <div className="rounded-2xl border border-white/10 bg-[#111827] p-5">
-              <h3 className="mb-6 text-lg font-semibold">
-                Booking Summary
-              </h3>
+              <h3 className="mb-6 text-lg font-semibold">Booking Summary</h3>
 
               {!booking ? (
                 <div className="flex min-h-64 items-center justify-center text-center text-sm text-gray-500">
@@ -405,7 +508,8 @@ export default function Home() {
                             <button
                               key={seat}
                               onClick={() => setSeatPreference(seat)}
-                              className={`rounded-lg border py-3 text-sm transition ${
+                              disabled={confirmLoading}
+                              className={`rounded-lg border py-3 text-sm transition disabled:opacity-50 ${
                                 seatPreference === seat
                                   ? "border-violet-400 bg-violet-600/20 text-violet-300"
                                   : "border-white/10 text-gray-400 hover:border-violet-400"
@@ -422,15 +526,19 @@ export default function Home() {
                           All required details collected!
                         </p>
                         <p className="mt-1 text-xs text-gray-400">
-                          Review your details before confirming.
+                          Review your details and seat preference before
+                          confirming.
                         </p>
                       </div>
 
                       <button
                         onClick={confirmBooking}
-                        className="mt-5 w-full rounded-xl bg-green-600 py-3 font-semibold transition hover:bg-green-500"
+                        disabled={confirmLoading || loading}
+                        className="mt-5 w-full rounded-xl bg-green-600 py-3 font-semibold transition hover:bg-green-500 disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        Confirm Booking →
+                        {confirmLoading
+                          ? "Confirming..."
+                          : "Confirm Booking →"}
                       </button>
 
                       <p className="mt-3 text-center text-xs text-gray-500">
@@ -454,6 +562,12 @@ export default function Home() {
               )}
             </div>
           </div>
+        )}
+
+        {error && (
+          <p className="mx-auto mt-6 max-w-2xl rounded-lg border border-red-400/20 bg-red-400/10 p-4 text-sm text-red-300">
+            {error}
+          </p>
         )}
       </section>
 
